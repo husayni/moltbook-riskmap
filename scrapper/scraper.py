@@ -57,13 +57,26 @@ def parse_author(obj: dict) -> str | None:
     return None
 
 
-def ensure_agent(name: str) -> None:
-    if not name:
-        return
-    supabase.table("agents").upsert(
-        {"name": name, "raw": {}},
-        on_conflict="name",
-    ).execute()
+def row_agent(author: dict) -> dict:
+    """Build agent row from API author object (post.author or comment.author)."""
+    if not author or not author.get("name"):
+        return None
+    owner = author.get("owner") or {}
+    return {
+        "name": author.get("name"),
+        "description": author.get("description"),
+        "karma": author.get("karma") if author.get("karma") is not None else 0,
+        "follower_count": author.get("follower_count") if author.get("follower_count") is not None else 0,
+        "following_count": author.get("following_count") if author.get("following_count") is not None else 0,
+        "owner_x_handle": owner.get("x_handle"),
+        "owner_x_name": owner.get("x_name"),
+        "owner_x_avatar": owner.get("x_avatar"),
+        "owner_x_bio": owner.get("x_bio"),
+        "owner_x_follower_count": owner.get("x_follower_count"),
+        "owner_x_following_count": owner.get("x_following_count"),
+        "owner_x_verified": owner.get("x_verified") if owner.get("x_verified") is not None else False,
+        "raw": author,
+    }
 
 
 def run_feed() -> list[tuple[int, str, dict]]:
@@ -135,6 +148,23 @@ def run_once() -> None:
     feed_items = run_feed()
     print(f"  Fetched {len(feed_items)} posts from hot feed")
 
+    # One query: all ingest_state for comments:<post_id>
+    sources = [f"comments:{pid}" for _, pid, _ in feed_items]
+    state_res = (
+        supabase.table("ingest_state")
+        .select("source, last_seen_id")
+        .in_("source", sources)
+        .execute()
+    )
+    last_seen_by_source = {r["source"]: r["last_seen_id"] for r in (state_res.data or []) if r.get("last_seen_id")}
+
+    authors: set[str] = set()
+    post_rows: list[dict] = []
+    all_new_comments: list[dict] = []
+    ingest_state_rows: list[dict] = []
+    snapshot_rows: list[dict] = []
+    total_new_comments = 0
+
     for i, (rank, post_id, raw_item) in enumerate(feed_items, 1):
         print(f"  [{i}/{len(feed_items)}] Post {post_id[:8]}...", end=" ", flush=True)
         try:
@@ -145,59 +175,56 @@ def run_once() -> None:
 
         author = parse_author(data.get("author") or data.get("author_name"))
         if author:
-            ensure_agent(author)
+            authors.add(author)
 
-        post_row = row_post(post_id, data)
-        supabase.table("posts").upsert(post_row, on_conflict="id").execute()
+        post_rows.append(row_post(post_id, data))
 
         comments_tree = data.get("comments") or data.get("comment_tree") or []
         flat = flatten_comments(comments_tree if isinstance(comments_tree, list) else [comments_tree])
-        # Newest first typical; stop at first known id
         source = f"comments:{post_id}"
-        state = supabase.table("ingest_state").select("last_seen_id").eq("source", source).execute()
-        last_seen = (state.data or [{}])[0].get("last_seen_id") if state.data else None
-        known = {last_seen} if last_seen else set()
+        last_seen = last_seen_by_source.get(source)
         new_comments = []
         for c in flat:
             cid = c.get("id")
             if not cid:
                 continue
-            if cid in known or cid == last_seen:
+            if cid == last_seen:
                 break
             new_comments.append(row_comment(c, post_id))
-            author_name = parse_author(c.get("author") or c.get("author_name"))
-            print(f"new agent {author_name}")
-            if author_name:
-                ensure_agent(author_name)
-        if new_comments:
-            supabase.table("comments").upsert(new_comments, on_conflict="id").execute()
-            print(f"+{len(new_comments)} comments")
-        else:
-            print("ok")
-        if flat:
-            newest_id = flat[0].get("id")
-            if newest_id:
-                supabase.table("ingest_state").upsert(
-                    {
-                        "source": source,
-                        "last_seen_id": newest_id,
-                        "last_seen_created_at": flat[0].get("created_at"),
-                    },
-                    on_conflict="source",
-                ).execute()
+            an = parse_author(c.get("author") or c.get("author_name"))
+            if an:
+                authors.add(an)
+        total_new_comments += len(new_comments)
+        all_new_comments.extend(new_comments)
+        if flat and flat[0].get("id"):
+            ingest_state_rows.append(
+                {
+                    "source": source,
+                    "last_seen_id": flat[0]["id"],
+                    "last_seen_created_at": flat[0].get("created_at"),
+                }
+            )
+        print(f"+{len(new_comments)} comments" if new_comments else "ok")
+        snapshot_rows.append(
+            {"feed_type": "hot", "fetched_at": fetched_at, "rank": rank, "post_id": post_id, "raw": raw_item}
+        )
 
-    for rank, post_id, raw_item in feed_items:
-        supabase.table("feed_snapshots").insert(
-            {
-                "feed_type": "hot",
-                "fetched_at": fetched_at,
-                "rank": rank,
-                "post_id": post_id,
-                "raw": raw_item,
-            }
+    # Batch writes (agents first: FK from posts/comments)
+    if authors:
+        supabase.table("agents").upsert(
+            [{"name": n, "raw": {}} for n in authors],
+            on_conflict="name",
         ).execute()
+    if post_rows:
+        supabase.table("posts").upsert(post_rows, on_conflict="id").execute()
+    if all_new_comments:
+        supabase.table("comments").upsert(all_new_comments, on_conflict="id").execute()
+    if ingest_state_rows:
+        supabase.table("ingest_state").upsert(ingest_state_rows, on_conflict="source").execute()
+    if snapshot_rows:
+        supabase.table("feed_snapshots").insert(snapshot_rows).execute()
 
-    print(f"Done: {len(feed_items)} posts snapshot saved. Next run in {INTERVAL_SEC // 60} min.")
+    print(f"Done: {len(post_rows)} posts, {total_new_comments} new comments, {len(authors)} agents. Next run in {INTERVAL_SEC // 60} min.")
 
 
 def main() -> None:
