@@ -1,6 +1,7 @@
 """
 Moltbook scraper: hot feed every 15 min, posts + incremental comments.
 """
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -9,6 +10,9 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from supabase import create_client
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -34,13 +38,30 @@ except Exception as e:
     raise SystemExit(f"Supabase client failed: {e}") from e
 
 
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2.0  # exponential base
+
+
 def get(path: str, params: dict | None = None) -> dict:
-    r = requests.get(f"{BASE_URL}{path}", params=params or {}, timeout=30)
-    if r.status_code != 200:
-        print(f"Error: {r.status_code} {r.text}")
-        return {}
-    time.sleep(RATE_DELAY)
-    return r.json()
+    url = f"{BASE_URL}{path}"
+    params = params or {}
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers={"Authorization": f"Bearer {os.getenv('MOLTBOOK_API_KEY')}"})
+            if r.status_code == 200:
+                time.sleep(RATE_DELAY)
+                return r.json()
+            last_err = f"{r.status_code} {r.text[:200]}"
+            log.warning("get %s attempt %s: %s", path, attempt + 1, last_err)
+        except requests.RequestException as e:
+            last_err = e
+            log.warning("get %s attempt %s: %s", path, attempt + 1, e)
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF ** attempt)
+    log.warning("get %s failed after %s retries: %s", path, MAX_RETRIES, last_err)
+    return {}
 
 
 def flatten_comments(nodes: list, out: list | None = None) -> list:
@@ -149,18 +170,22 @@ def row_comment(c: dict, post_id: str) -> dict:
 def run_once() -> None:
     fetched_at = datetime.now(timezone.utc).isoformat()
     print(f"[{fetched_at}] Starting ingest...")
-    feed_items = run_feed(2)
+    feed_items = run_feed(limit=50)
     print(f"  Fetched {len(feed_items)} posts from hot feed")
 
     # One query: all ingest_state for comments:<post_id>
     sources = [f"comments:{pid}" for _, pid, _ in feed_items]
-    state_res = (
-        supabase.table("ingest_state")
-        .select("source, last_seen_id")
-        .in_("source", sources)
-        .execute()
-    )
-    last_seen_by_source = {r["source"]: r["last_seen_id"] for r in (state_res.data or []) if r.get("last_seen_id")}
+    last_seen_by_source: dict[str, str] = {}
+    try:
+        state_res = (
+            supabase.table("ingest_state")
+            .select("source, last_seen_id")
+            .in_("source", sources)
+            .execute()
+        )
+        last_seen_by_source = {r["source"]: r["last_seen_id"] for r in (state_res.data or []) if r.get("last_seen_id")}
+    except Exception as e:
+        log.warning("ingest_state select failed: %s", e)
 
     # name -> author dict (merge so we keep fullest profile, e.g. post.author has owner)
     author_dicts: dict[str, dict] = {}
@@ -172,10 +197,9 @@ def run_once() -> None:
 
     for i, (rank, post_id, raw_item) in enumerate(feed_items, 1):
         print(f"  [{i}/{len(feed_items)}] Post {post_id}...", end=" ", flush=True)
-        try:
-            resp = get(f"/posts/{post_id}")
-        except Exception as e:
-            print(f"skip: {e}")
+        resp = get(f"/posts/{post_id}")
+        if not resp:
+            print("skip (fetch failed)")
             continue
 
         # API: {"success": true, "post": {...}, "comments": [...]}
@@ -227,19 +251,34 @@ def run_once() -> None:
             {"feed_type": "hot", "fetched_at": fetched_at, "rank": rank, "post_id": post_id, "raw": raw_item}
         )
 
-    # Batch writes (agents first: FK from posts/comments)
+    # Batch writes (agents first: FK from posts/comments); skip on error, log warning
     agent_rows = [row_agent(ad) for ad in author_dicts.values()]
     agent_rows = [r for r in agent_rows if r]
-    if agent_rows:
-        supabase.table("agents").upsert(agent_rows, on_conflict="name").execute()
-    if post_rows:
-        supabase.table("posts").upsert(post_rows, on_conflict="id").execute()
-    if all_new_comments:
-        supabase.table("comments").upsert(all_new_comments, on_conflict="id").execute()
-    if ingest_state_rows:
-        supabase.table("ingest_state").upsert(ingest_state_rows, on_conflict="source").execute()
-    if snapshot_rows:
-        supabase.table("feed_snapshots").insert(snapshot_rows).execute()
+    try:
+        if agent_rows:
+            supabase.table("agents").upsert(agent_rows, on_conflict="name").execute()
+    except Exception as e:
+        log.warning("agents write failed: %s", e)
+    try:
+        if post_rows:
+            supabase.table("posts").upsert(post_rows, on_conflict="id").execute()
+    except Exception as e:
+        log.warning("posts write failed: %s", e)
+    try:
+        if all_new_comments:
+            supabase.table("comments").upsert(all_new_comments, on_conflict="id").execute()
+    except Exception as e:
+        log.warning("comments write failed: %s", e)
+    try:
+        if ingest_state_rows:
+            supabase.table("ingest_state").upsert(ingest_state_rows, on_conflict="source").execute()
+    except Exception as e:
+        log.warning("ingest_state write failed: %s", e)
+    try:
+        if snapshot_rows:
+            supabase.table("feed_snapshots").insert(snapshot_rows).execute()
+    except Exception as e:
+        log.warning("feed_snapshots write failed: %s", e)
 
     print(f"Done: {len(post_rows)} posts, {total_new_comments} new comments, {len(agent_rows)} agents. Next run in {INTERVAL_SEC // 60} min.")
 
