@@ -36,7 +36,9 @@ except Exception as e:
 
 def get(path: str, params: dict | None = None) -> dict:
     r = requests.get(f"{BASE_URL}{path}", params=params or {}, timeout=30)
-    r.raise_for_status()
+    if r.status_code != 200:
+        print(f"Error: {r.status_code} {r.text}")
+        return {}
     time.sleep(RATE_DELAY)
     return r.json()
 
@@ -79,13 +81,13 @@ def row_agent(author: dict) -> dict:
     }
 
 
-def run_feed() -> list[tuple[int, str, dict]]:
+def run_feed(limit: int = 50) -> list[tuple[int, str, dict]]:
     """Fetch hot feed with pagination; return list of (rank, post_id, raw)."""
     items = []
     offset = None
     rank = 0
-    while len(items) < 50:
-        params = {"sort": "top", "limit": 50}
+    while len(items) < limit:
+        params = {"sort": "top", "limit": limit}
         if offset is not None:
             params["offset"] = offset
         data = get("/posts", params)
@@ -95,23 +97,24 @@ def run_feed() -> list[tuple[int, str, dict]]:
             if pid:
                 rank += 1
                 items.append((rank, pid, p))
-                if rank >= 50:
+                if rank >= limit:
                     break
-        if rank >= 50 or not data.get("has_more"):
+        if rank >= limit or not data.get("has_more"):
             break
         offset = data.get("next_offset")
         if offset is None:
             break
-    return items[:50]
+    return items[:limit]
 
 
 def row_post(post_id: str, data: dict) -> dict:
+    # API: post has submolt: {name}, author: {name}, ...
+    submolt = data.get("submolt")
+    submolt_name = submolt.get("name") if isinstance(submolt, dict) else data.get("submolt_name")
     author = parse_author(data.get("author") or data.get("author_name"))
-    created = data.get("created_at")
-    updated = data.get("updated_at")
     return {
         "id": post_id,
-        "submolt_name": data.get("submolt_name"),
+        "submolt_name": submolt_name,
         "author_name": author,
         "title": data.get("title"),
         "content": data.get("content"),
@@ -120,13 +123,14 @@ def row_post(post_id: str, data: dict) -> dict:
         "downvotes": data.get("downvotes", 0) or 0,
         "comment_count": data.get("comment_count", 0) or 0,
         "last_comment_at": data.get("last_comment_at"),
-        "created_at": created,
-        "updated_at": updated,
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
         "raw": data,
     }
 
 
 def row_comment(c: dict, post_id: str) -> dict:
+    # API: comment has author: {name}, id, content, parent_id, upvotes, downvotes, created_at
     author = parse_author(c.get("author") or c.get("author_name"))
     return {
         "id": c.get("id"),
@@ -145,7 +149,7 @@ def row_comment(c: dict, post_id: str) -> dict:
 def run_once() -> None:
     fetched_at = datetime.now(timezone.utc).isoformat()
     print(f"[{fetched_at}] Starting ingest...")
-    feed_items = run_feed()
+    feed_items = run_feed(2)
     print(f"  Fetched {len(feed_items)} posts from hot feed")
 
     # One query: all ingest_state for comments:<post_id>
@@ -158,7 +162,8 @@ def run_once() -> None:
     )
     last_seen_by_source = {r["source"]: r["last_seen_id"] for r in (state_res.data or []) if r.get("last_seen_id")}
 
-    authors: set[str] = set()
+    # name -> author dict (merge so we keep fullest profile, e.g. post.author has owner)
+    author_dicts: dict[str, dict] = {}
     post_rows: list[dict] = []
     all_new_comments: list[dict] = []
     ingest_state_rows: list[dict] = []
@@ -166,20 +171,28 @@ def run_once() -> None:
     total_new_comments = 0
 
     for i, (rank, post_id, raw_item) in enumerate(feed_items, 1):
-        print(f"  [{i}/{len(feed_items)}] Post {post_id[:8]}...", end=" ", flush=True)
+        print(f"  [{i}/{len(feed_items)}] Post {post_id}...", end=" ", flush=True)
         try:
-            data = get(f"/posts/{post_id}")
+            resp = get(f"/posts/{post_id}")
         except Exception as e:
             print(f"skip: {e}")
             continue
 
-        author = parse_author(data.get("author") or data.get("author_name"))
-        if author:
-            authors.add(author)
+        # API: {"success": true, "post": {...}, "comments": [...]}
+        data = resp.get("post") or resp
+        comments_tree = resp.get("comments") or data.get("comments") or data.get("comment_tree") or []
+
+        author_obj = data.get("author") or data.get("author_name")
+        if isinstance(author_obj, dict):
+            name = author_obj.get("name")
+            if name:
+                existing = author_dicts.get(name) or {}
+                author_dicts[name] = {**existing, **{k: v for k, v in author_obj.items() if v is not None}}
+        elif author_obj:
+            author_dicts.setdefault(str(author_obj), {"name": str(author_obj)})
 
         post_rows.append(row_post(post_id, data))
 
-        comments_tree = data.get("comments") or data.get("comment_tree") or []
         flat = flatten_comments(comments_tree if isinstance(comments_tree, list) else [comments_tree])
         source = f"comments:{post_id}"
         last_seen = last_seen_by_source.get(source)
@@ -191,9 +204,14 @@ def run_once() -> None:
             if cid == last_seen:
                 break
             new_comments.append(row_comment(c, post_id))
-            an = parse_author(c.get("author") or c.get("author_name"))
-            if an:
-                authors.add(an)
+            author_obj = c.get("author") or c.get("author_name")
+            if isinstance(author_obj, dict):
+                name = author_obj.get("name")
+                if name:
+                    existing = author_dicts.get(name) or {}
+                    author_dicts[name] = {**existing, **{k: v for k, v in author_obj.items() if v is not None}}
+            elif author_obj:
+                author_dicts.setdefault(str(author_obj), {"name": str(author_obj)})
         total_new_comments += len(new_comments)
         all_new_comments.extend(new_comments)
         if flat and flat[0].get("id"):
@@ -210,11 +228,10 @@ def run_once() -> None:
         )
 
     # Batch writes (agents first: FK from posts/comments)
-    if authors:
-        supabase.table("agents").upsert(
-            [{"name": n, "raw": {}} for n in authors],
-            on_conflict="name",
-        ).execute()
+    agent_rows = [row_agent(ad) for ad in author_dicts.values()]
+    agent_rows = [r for r in agent_rows if r]
+    if agent_rows:
+        supabase.table("agents").upsert(agent_rows, on_conflict="name").execute()
     if post_rows:
         supabase.table("posts").upsert(post_rows, on_conflict="id").execute()
     if all_new_comments:
@@ -224,7 +241,7 @@ def run_once() -> None:
     if snapshot_rows:
         supabase.table("feed_snapshots").insert(snapshot_rows).execute()
 
-    print(f"Done: {len(post_rows)} posts, {total_new_comments} new comments, {len(authors)} agents. Next run in {INTERVAL_SEC // 60} min.")
+    print(f"Done: {len(post_rows)} posts, {total_new_comments} new comments, {len(agent_rows)} agents. Next run in {INTERVAL_SEC // 60} min.")
 
 
 def main() -> None:
