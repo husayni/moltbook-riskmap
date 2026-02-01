@@ -20,6 +20,9 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 BASE_URL = "https://www.moltbook.com/api/v1"
 RATE_DELAY = 1.1  # ~55 req/min under 60/min
 INTERVAL_SEC = 15 * 60
+BATCH_SIZE = 10  # flush to DB after every N posts
+SORT_POSTS = "top" # "discussed" # "top"
+LIMIT_POSTS = 50
 
 project_ref = os.getenv("SUPABASE_PROJECT_REF")
 service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
@@ -38,7 +41,7 @@ except Exception as e:
     raise SystemExit(f"Supabase client failed: {e}") from e
 
 
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2.0  # exponential base
 
@@ -108,7 +111,7 @@ def run_feed(limit: int = 50) -> list[tuple[int, str, dict]]:
     offset = None
     rank = 0
     while len(items) < limit:
-        params = {"sort": "top", "limit": limit}
+        params = {"sort": SORT_POSTS, "limit": limit}
         if offset is not None:
             params["offset"] = offset
         data = get("/posts", params)
@@ -167,10 +170,54 @@ def row_comment(c: dict, post_id: str) -> dict:
     }
 
 
+def _flush_batch(
+    author_dicts: dict[str, dict],
+    post_rows: list[dict],
+    all_new_comments: list[dict],
+    ingest_state_rows: list[dict],
+    snapshot_rows: list[dict],
+) -> None:
+    """Upsert/insert current batch to DB; log warning on error."""
+    batch_author_names = set()
+    for r in post_rows:
+        if r.get("author_name"):
+            batch_author_names.add(r["author_name"])
+    for c in all_new_comments:
+        if c.get("author_name"):
+            batch_author_names.add(c["author_name"])
+    agent_rows = [row_agent(author_dicts[n]) for n in batch_author_names if n in author_dicts]
+    agent_rows = [r for r in agent_rows if r]
+    try:
+        if agent_rows:
+            supabase.table("agents").upsert(agent_rows, on_conflict="name").execute()
+    except Exception as e:
+        log.warning("agents write failed: %s", e)
+    try:
+        if post_rows:
+            supabase.table("posts").upsert(post_rows, on_conflict="id").execute()
+    except Exception as e:
+        log.warning("posts write failed: %s", e)
+    try:
+        if all_new_comments:
+            supabase.table("comments").upsert(all_new_comments, on_conflict="id").execute()
+    except Exception as e:
+        log.warning("comments write failed: %s", e)
+    try:
+        if ingest_state_rows:
+            supabase.table("ingest_state").upsert(ingest_state_rows, on_conflict="source").execute()
+    except Exception as e:
+        log.warning("ingest_state write failed: %s", e)
+    try:
+        if snapshot_rows:
+            supabase.table("feed_snapshots").insert(snapshot_rows).execute()
+    except Exception as e:
+        log.warning("feed_snapshots write failed: %s", e)
+
+
 def run_once() -> None:
     fetched_at = datetime.now(timezone.utc).isoformat()
     print(f"[{fetched_at}] Starting ingest...")
-    feed_items = run_feed(limit=50)
+    feed_items = run_feed(limit=LIMIT_POSTS)
     print(f"  Fetched {len(feed_items)} posts from hot feed")
 
     # One query: all ingest_state for comments:<post_id>
@@ -246,41 +293,28 @@ def run_once() -> None:
                     "last_seen_created_at": flat[0].get("created_at"),
                 }
             )
-        print(f"+{len(new_comments)} comments" if new_comments else "ok")
+            print(f"+{len(new_comments)} comments" if new_comments else "ok")
         snapshot_rows.append(
             {"feed_type": "hot", "fetched_at": fetched_at, "rank": rank, "post_id": post_id, "raw": raw_item}
         )
 
-    # Batch writes (agents first: FK from posts/comments); skip on error, log warning
-    agent_rows = [row_agent(ad) for ad in author_dicts.values()]
-    agent_rows = [r for r in agent_rows if r]
-    try:
-        if agent_rows:
-            supabase.table("agents").upsert(agent_rows, on_conflict="name").execute()
-    except Exception as e:
-        log.warning("agents write failed: %s", e)
-    try:
-        if post_rows:
-            supabase.table("posts").upsert(post_rows, on_conflict="id").execute()
-    except Exception as e:
-        log.warning("posts write failed: %s", e)
-    try:
-        if all_new_comments:
-            supabase.table("comments").upsert(all_new_comments, on_conflict="id").execute()
-    except Exception as e:
-        log.warning("comments write failed: %s", e)
-    try:
-        if ingest_state_rows:
-            supabase.table("ingest_state").upsert(ingest_state_rows, on_conflict="source").execute()
-    except Exception as e:
-        log.warning("ingest_state write failed: %s", e)
-    try:
-        if snapshot_rows:
-            supabase.table("feed_snapshots").insert(snapshot_rows).execute()
-    except Exception as e:
-        log.warning("feed_snapshots write failed: %s", e)
+        # Flush to DB every BATCH_SIZE posts
+        if len(post_rows) >= BATCH_SIZE:
+            _flush_batch(
+                author_dicts, post_rows, all_new_comments, ingest_state_rows, snapshot_rows
+            )
+            post_rows.clear()
+            all_new_comments.clear()
+            ingest_state_rows.clear()
+            snapshot_rows.clear()
 
-    print(f"Done: {len(post_rows)} posts, {total_new_comments} new comments, {len(agent_rows)} agents. Next run in {INTERVAL_SEC // 60} min.")
+    # Flush remainder
+    if post_rows:
+        _flush_batch(
+            author_dicts, post_rows, all_new_comments, ingest_state_rows, snapshot_rows
+        )
+
+    print(f"Done: {len(feed_items)} posts, {total_new_comments} new comments. Next run in {INTERVAL_SEC // 60} min.")
 
 
 def main() -> None:
