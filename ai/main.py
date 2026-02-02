@@ -22,8 +22,9 @@ from prompt import SYSTEM_PROMPT  # noqa: E402
 
 CATEGORY_KEYS: tuple[str, ...] = (
     "none",
-    "capability",
+    "capability_misalignment",
     "instructional_subversion",
+    "instrumental_convergence",
     "autonomy_replication",
     "deceptive_behavior",
     "sycophancy",
@@ -33,6 +34,7 @@ CATEGORY_KEYS: tuple[str, ...] = (
 class SeverityByCategory(BaseModel):
     capability_misalignment: conint(ge=0, le=3)
     instructional_subversion: conint(ge=0, le=3)
+    instrumental_convergence: conint(ge=0, le=3)
     autonomy_replication: conint(ge=0, le=3)
     deceptive_behavior: conint(ge=0, le=3)
     sycophancy: conint(ge=0, le=3)
@@ -49,8 +51,9 @@ class RiskResult(BaseModel):
     overall_misalignment_score: conint(ge=0, le=3)
     primary_risk_category: Literal[
         "none",
-        "capability",
+        "capability_misalignment",
         "instructional_subversion",
+        "instrumental_convergence",
         "autonomy_replication",
         "deceptive_behavior",
         "sycophancy",
@@ -273,9 +276,18 @@ def ensure_profile(
 
 
 def normalize_category(category: str | None) -> str:
-    if not category or category not in CATEGORY_KEYS:
+    if not category:
         return "none"
-    return category
+    legacy_map = {
+        "capability": "capability_misalignment",
+        "instrumental": "instrumental_convergence",
+        "autonomy": "autonomy_replication",
+        "deceptive": "deceptive_behavior",
+    }
+    mapped = legacy_map.get(category, category)
+    if mapped not in CATEGORY_KEYS:
+        return "none"
+    return mapped
 
 
 def update_profile(
@@ -296,6 +308,47 @@ def update_profile(
     else:
         profile["total_comments"] += 1
         profile["comment_counts"][normalized] += 1
+
+
+def ensure_submolt(
+    scores: dict[str, dict],
+    submolt_id: str,
+    *,
+    submolt_name: str | None,
+) -> dict:
+    if submolt_id not in scores:
+        scores[submolt_id] = {
+            "submolt_id": submolt_id,
+            "submolt_name": submolt_name or "",
+            "total_posts": 0,
+            "total_comments": 0,
+            "post_counts": empty_category_counts(),
+            "comment_counts": empty_category_counts(),
+        }
+    entry = scores[submolt_id]
+    if submolt_name and not entry.get("submolt_name"):
+        entry["submolt_name"] = submolt_name
+    return entry
+
+
+def update_submolt(
+    scores: dict[str, dict],
+    *,
+    submolt_id: str | None,
+    submolt_name: str | None,
+    category: str | None,
+    record_type: Literal["post", "comment"],
+) -> None:
+    if not submolt_id:
+        return
+    entry = ensure_submolt(scores, submolt_id, submolt_name=submolt_name)
+    normalized = normalize_category(category)
+    if record_type == "post":
+        entry["total_posts"] += 1
+        entry["post_counts"][normalized] += 1
+    else:
+        entry["total_comments"] += 1
+        entry["comment_counts"][normalized] += 1
 
 
 def load_agent_profiles(profile_path: Path) -> dict[str, dict]:
@@ -321,6 +374,97 @@ def load_agent_profiles(profile_path: Path) -> dict[str, dict]:
         profiles[agent_id] = profile
     return profiles
 
+
+def load_submolt_scores(scores_path: Path) -> dict[str, dict]:
+    if not scores_path.exists():
+        return {}
+    try:
+        data = json.loads(scores_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    scores: dict[str, dict] = {}
+    for submolt_id, entry in (data or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        entry.setdefault("submolt_id", submolt_id)
+        entry.setdefault("submolt_name", "")
+        entry.setdefault("total_posts", 0)
+        entry.setdefault("total_comments", 0)
+        entry.setdefault("post_counts", empty_category_counts())
+        entry.setdefault("comment_counts", empty_category_counts())
+        for key in CATEGORY_KEYS:
+            entry["post_counts"].setdefault(key, 0)
+            entry["comment_counts"].setdefault(key, 0)
+        scores[submolt_id] = entry
+    return scores
+
+
+def rebuild_submolt_scores(
+    *,
+    post_output_path: Path,
+    comment_output_path: Path,
+) -> dict[str, dict]:
+    scores: dict[str, dict] = {}
+    post_to_submolt: dict[str, tuple[str, str]] = {}
+
+    def ingest_posts(path: Path) -> None:
+        if not path.exists():
+            return
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                post_id = data.get("post_id")
+                submolt_name = data.get("submolt") or "unknown"
+                submolt_id = data.get("submolt_id") or submolt_name
+                if post_id:
+                    post_to_submolt[post_id] = (submolt_id, submolt_name)
+                result = data.get("result") or {}
+                update_submolt(
+                    scores,
+                    submolt_id=submolt_id,
+                    submolt_name=submolt_name,
+                    category=result.get("primary_risk_category"),
+                    record_type="post",
+                )
+
+    def ingest_comments(path: Path) -> None:
+        if not path.exists():
+            return
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                post_id = data.get("post_id")
+                if not post_id:
+                    continue
+                submolt_entry = post_to_submolt.get(post_id)
+                if not submolt_entry:
+                    continue
+                submolt_id, submolt_name = submolt_entry
+                result = data.get("result") or {}
+                update_submolt(
+                    scores,
+                    submolt_id=submolt_id,
+                    submolt_name=submolt_name,
+                    category=result.get("primary_risk_category"),
+                    record_type="comment",
+                )
+
+    ingest_posts(post_output_path)
+    ingest_comments(comment_output_path)
+    return scores
+
+
+def write_json(path: Path, data: dict[str, dict]) -> None:
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 def rebuild_agent_profiles(
     *,
@@ -388,25 +532,31 @@ def parse_args() -> argparse.Namespace:
         help="Output JSON path for agent profile aggregates.",
     )
     parser.add_argument(
+        "--submolt-output",
+        type=Path,
+        default=Path("/home/hussain/hackathons/moltbook-riskmap/data/submolt_scores.json"),
+        help="Output JSON path for submolt aggregates.",
+    )
+    parser.add_argument(
         "--model",
-        default=os.getenv("INFERENCE_GATEWAY_MODEL")
+        default=os.getenv("OPENROUTER_MODEL")
+        or os.getenv("INFERENCE_GATEWAY_MODEL")
         or os.getenv("OLLAMA_MODEL")
-        or os.getenv("OPENROUTER_MODEL")
-        or "gpt-oss:120b-cloud",
+        or "openai/gpt-oss-120b",
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("INFERENCE_GATEWAY_BASE_URL")
+        default=os.getenv("OPENROUTER_BASE_URL")
+        or os.getenv("INFERENCE_GATEWAY_BASE_URL")
         or os.getenv("OLLAMA_BASE_URL")
-        or os.getenv("OPENROUTER_BASE_URL")
-        or "https://inference-gateway1.projectsq.org/v1",
+        or "https://openrouter.ai/api/v1",
     )
     parser.add_argument(
         "--api-key",
-        default=os.getenv("INFERENCE_GATEWAY_API_KEY")
+        default=os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("INFERENCE_GATEWAY_API_KEY")
         or os.getenv("PROJECTSQ_API_KEY")
         or os.getenv("OLLAMA_API_KEY")
-        or os.getenv("OPENROUTER_API_KEY")
         or "ollama",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -473,7 +623,8 @@ def main() -> int:
 
     if not args.dry_run and not args.api_key:
         print(
-            "Missing API key. Set INFERENCE_GATEWAY_API_KEY/PROJECTSQ_API_KEY "
+            "Missing API key. Set OPENROUTER_API_KEY "
+            "(or INFERENCE_GATEWAY_API_KEY/PROJECTSQ_API_KEY) "
             "or pass --api-key.",
             file=sys.stderr,
         )
@@ -486,10 +637,12 @@ def main() -> int:
     post_output_path: Path = args.post_output
     comment_output_path: Path = args.comment_output
     profile_output_path: Path = args.agent_profile_output
+    submolt_output_path: Path = args.submolt_output
 
     post_output_path.parent.mkdir(parents=True, exist_ok=True)
     comment_output_path.parent.mkdir(parents=True, exist_ok=True)
     profile_output_path.parent.mkdir(parents=True, exist_ok=True)
+    submolt_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     seen_ids: set[str] = set()
     if args.resume:
@@ -502,6 +655,12 @@ def main() -> int:
     profiles = load_agent_profiles(profile_output_path)
     if args.resume and not profiles and (post_output_path.exists() or comment_output_path.exists()):
         profiles = rebuild_agent_profiles(
+            post_output_path=post_output_path, comment_output_path=comment_output_path
+        )
+
+    submolt_scores = load_submolt_scores(submolt_output_path)
+    if args.resume and not submolt_scores and (post_output_path.exists() or comment_output_path.exists()):
+        submolt_scores = rebuild_submolt_scores(
             post_output_path=post_output_path, comment_output_path=comment_output_path
         )
 
@@ -532,6 +691,11 @@ def main() -> int:
                 continue
 
             author = post.get("author") or {}
+            submolt_data = post.get("submolt") or {}
+            submolt_id = submolt_data.get("id") or submolt_data.get("name") or ""
+            submolt_name = (
+                submolt_data.get("display_name") or submolt_data.get("name") or submolt_id
+            )
             author_id = author.get("id")
             author_name = normalize_text(author.get("name") or "")
 
@@ -595,8 +759,8 @@ def main() -> int:
                         "post_id": post_id,
                         "title": post.get("title"),
                         "created_at": post.get("created_at"),
-                        "submolt": (post.get("submolt") or {}).get("display_name")
-                        or (post.get("submolt") or {}).get("name"),
+                        "submolt_id": submolt_id,
+                        "submolt": submolt_name,
                         "author_id": author_id,
                         "author_name": author_name,
                         "model": args.model,
@@ -613,6 +777,15 @@ def main() -> int:
                         category=result_data.primary_risk_category,
                         record_type="post",
                     )
+                    update_submolt(
+                        submolt_scores,
+                        submolt_id=submolt_id,
+                        submolt_name=submolt_name,
+                        category=result_data.primary_risk_category,
+                        record_type="post",
+                    )
+                    write_json(profile_output_path, profiles)
+                    write_json(submolt_output_path, submolt_scores)
                     if args.sleep:
                         time.sleep(args.sleep)
 
@@ -701,13 +874,20 @@ def main() -> int:
                     category=result_data.primary_risk_category,
                     record_type="comment",
                 )
+                update_submolt(
+                    submolt_scores,
+                    submolt_id=submolt_id,
+                    submolt_name=submolt_name,
+                    category=result_data.primary_risk_category,
+                    record_type="comment",
+                )
+                write_json(profile_output_path, profiles)
+                write_json(submolt_output_path, submolt_scores)
                 if args.sleep:
                     time.sleep(args.sleep)
 
-    profile_output_path.write_text(
-        json.dumps(profiles, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(profile_output_path, profiles)
+    write_json(submolt_output_path, submolt_scores)
     return 0
 
 
